@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""
+激光雷达点云投影到图像（路径直接写在代码中）
+"""
+
+import cv2
+import numpy as np
+import os
+import struct
+
+# ==================== 在这里修改你的文件路径 ====================
+PCD_FILE = r"C:\Users\ASUS\PycharmProjects\pcd2img\MARS-LVIGpoint_per5\1669702821.499936.pcd"         # 点云文件
+IMAGE_FILE = r"C:\Users\ASUS\PycharmProjects\pcd2img\MARS-LVIGimage_per5\1669702821.584584.jpg"             # 背景图像
+INTRINSICS_FILE = r"C:\Users\ASUS\PycharmProjects\pcd2img\intrinsics.txt"   # 相机内参矩阵
+DIST_COEFFS_FILE = r"C:\Users\ASUS\PycharmProjects\pcd2img\dist_coeffs.txt" # 畸变系数
+EXTRINSICS_FILE = r"C:\Users\ASUS\PycharmProjects\pcd2img\extrinsics.txt"   # 雷达->相机外参 (4x4)
+OUTPUT_FILE = r"C:\Users\ASUS\PycharmProjects\pcd2img\out\MARS-LVIG_result.png"           # 输出图像
+
+# 渲染参数
+POINT_RADIUS = 2            # 点的半径（像素）
+USE_DEPTH_COLOR = True     # 是否用深度信息着色（True/False）
+MAX_DEPTH = 200.0            # 深度彩色化的最大距离（米）
+# 在 points, colors = read_pcd(PCD_FILE) 之后
+sample_ratio = 1  # 保留 5% 的点
+# ================================================================
+
+# ----------------------------- 点云读取（纯 NumPy）-----------------------------
+def read_pcd_ascii(filepath):
+    """
+    读取 ASCII 格式的 PCD 文件（支持带 COLOR 或 RGB 字段）
+    返回: points (N,3), colors (N,3) 或 None
+    """
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+
+    # 解析头部
+    header = []
+    data_start = 0
+    for i, line in enumerate(lines):
+        header.append(line.strip())
+        if line.startswith('DATA'):
+            data_format = line.split()[-1].lower()
+            data_start = i + 1
+            break
+
+    # 获取字段信息
+    fields = []
+    size = []
+    type_ = []
+    count = []
+    for line in header:
+        if line.startswith('FIELDS'):
+            fields = line.split()[1:]
+        elif line.startswith('SIZE'):
+            size = list(map(int, line.split()[1:]))
+        elif line.startswith('TYPE'):
+            type_ = line.split()[1:]
+        elif line.startswith('COUNT'):
+            count = list(map(int, line.split()[1:]))
+        elif line.startswith('POINTS'):
+            n_points = int(line.split()[1])
+
+    # 确定 x, y, z, rgb 的索引
+    idx_x = fields.index('x') if 'x' in fields else None
+    idx_y = fields.index('y') if 'y' in fields else None
+    idx_z = fields.index('z') if 'z' in fields else None
+    idx_rgb = None
+    if 'rgb' in fields:
+        idx_rgb = fields.index('rgb')
+    elif 'RGB' in fields:
+        idx_rgb = fields.index('RGB')
+
+    # 读取数据
+    data_lines = lines[data_start:data_start + n_points]
+    points = []
+    colors = [] if idx_rgb is not None else None
+
+    for line in data_lines:
+        if not line.strip():
+            continue
+        parts = line.strip().split()
+        x = float(parts[idx_x]) if idx_x is not None else 0.0
+        y = float(parts[idx_y]) if idx_y is not None else 0.0
+        z = float(parts[idx_z]) if idx_z is not None else 0.0
+        points.append([x, y, z])
+
+        if idx_rgb is not None:
+            raw = parts[idx_rgb]
+            if '.' in raw:  # float 编码的 rgb
+                rgb_int = int(float(raw))
+                r = (rgb_int >> 16) & 0xFF
+                g = (rgb_int >> 8) & 0xFF
+                b = rgb_int & 0xFF
+            else:  # 已经是整数
+                rgb_int = int(raw)
+                r = (rgb_int >> 16) & 0xFF
+                g = (rgb_int >> 8) & 0xFF
+                b = rgb_int & 0xFF
+            colors.append([r / 255.0, g / 255.0, b / 255.0])
+
+    points = np.array(points, dtype=np.float32)
+    if colors is not None:
+        colors = np.array(colors, dtype=np.float32)
+    return points, colors
+
+
+def read_pcd_binary(filepath):
+    """
+    读取二进制格式的 PCD 文件（DATA binary）
+    返回: points (N,3), colors (N,3) 或 None
+    """
+    with open(filepath, 'rb') as f:
+        # 读取头部直到 DATA 行
+        header_lines = []
+        while True:
+            line = f.readline().decode('utf-8').strip()
+            header_lines.append(line)
+            if line.startswith('DATA'):
+                data_format = line.split()[-1].lower()
+                break
+        # 解析头部信息
+        fields = []
+        size = []
+        type_ = []
+        count = []
+        n_points = 0
+        for line in header_lines:
+            if line.startswith('FIELDS'):
+                fields = line.split()[1:]
+            elif line.startswith('SIZE'):
+                size = list(map(int, line.split()[1:]))
+            elif line.startswith('TYPE'):
+                type_ = line.split()[1:]
+            elif line.startswith('COUNT'):
+                count = list(map(int, line.split()[1:]))
+            elif line.startswith('POINTS'):
+                n_points = int(line.split()[1])
+            elif line.startswith('WIDTH'):
+                width = int(line.split()[1])
+            elif line.startswith('HEIGHT'):
+                height = int(line.split()[1])
+        # 获取 x, y, z, rgb 的索引和数据类型
+        idx_x = fields.index('x') if 'x' in fields else None
+        idx_y = fields.index('y') if 'y' in fields else None
+        idx_z = fields.index('z') if 'z' in fields else None
+        idx_rgb = fields.index('rgb') if 'rgb' in fields else (fields.index('RGB') if 'RGB' in fields else None)
+
+        # 计算每个点的字节大小
+        point_step = sum(size)
+
+        # 确定数据类型格式（用于 struct）
+        # TYPE: 'F'=float, 'U'=uint, 'I'=int32, 'I' may be ambiguous, use format string
+        fmt = '<'  # little-endian (PCD default? Usually little-endian)
+        for i, typ in enumerate(type_):
+            s = size[i]
+            if typ == 'F':
+                fmt += 'f' if s == 4 else 'd'
+            elif typ == 'U':
+                fmt += 'B' if s == 1 else 'H' if s == 2 else 'I'
+            elif typ == 'I':
+                fmt += 'b' if s == 1 else 'h' if s == 2 else 'i'
+            else:
+                raise ValueError(f"Unknown type {typ}")
+        point_fmt = fmt
+        point_size = struct.calcsize(point_fmt)
+        assert point_size == point_step, f"Point size mismatch: {point_size} vs {point_step}"
+
+        # 读取二进制数据
+        data = f.read(n_points * point_step)
+        points = []
+        colors = [] if idx_rgb is not None else None
+        offset = 0
+        for i in range(n_points):
+            # 解析一个点
+            values = struct.unpack_from(point_fmt, data, offset)
+            offset += point_size
+            # 提取坐标
+            x = values[idx_x] if idx_x is not None else 0.0
+            y = values[idx_y] if idx_y is not None else 0.0
+            z = values[idx_z] if idx_z is not None else 0.0
+            points.append([x, y, z])
+            # 提取颜色
+            if idx_rgb is not None:
+                rgb_val = values[idx_rgb]
+                if isinstance(rgb_val, float):
+                    rgb_int = int(rgb_val)
+                else:
+                    rgb_int = rgb_val
+                r = (rgb_int >> 16) & 0xFF
+                g = (rgb_int >> 8) & 0xFF
+                b = rgb_int & 0xFF
+                colors.append([r / 255.0, g / 255.0, b / 255.0])
+        points = np.array(points, dtype=np.float32)
+        if colors:
+            colors = np.array(colors, dtype=np.float32)
+        return points, colors
+
+def read_pcd(filepath):
+    """自动判断 PCD 格式，支持 ASCII 和 binary（不支持 compressed）"""
+    with open(filepath, 'rb') as f:
+        header = f.read(4096).decode('utf-8', errors='ignore')
+        if 'DATA ascii' in header:
+            return read_pcd_ascii(filepath)
+        elif 'DATA binary' in header:
+            # 确保文件指针回到开头？read_pcd_binary 会重新打开文件，没问题
+            return read_pcd_binary(filepath)
+        else:
+            raise NotImplementedError(
+                "目前仅支持 ASCII 或 binary 格式的 PCD 文件。"
+                "不支持 binary_compressed，你可以先用 pcl 工具转换："
+                "pcl_convert_pcd_ascii input.pcd output.pcd"
+            )
+
+
+# ----------------------------- 标定参数加载 -----------------------------
+def load_intrinsics(filepath):
+    return np.loadtxt(filepath, dtype=np.float32)
+
+
+def load_dist_coeffs(filepath):
+    coeffs = np.loadtxt(filepath, dtype=np.float32)
+    if coeffs.ndim == 0:
+        coeffs = np.array([coeffs])
+    return coeffs
+
+
+def load_extrinsics(filepath):
+    mat = np.loadtxt(filepath, dtype=np.float32)
+    assert mat.shape == (4, 4), "外参矩阵必须是 4x4 的齐次矩阵"
+    return mat
+
+
+# ----------------------------- 投影核心 -----------------------------
+def project_points(points, K, dist_coeffs, T_lidar_to_cam):
+    N = points.shape[0]
+    points_hom = np.hstack((points, np.ones((N, 1))))
+    points_cam_hom = (T_lidar_to_cam @ points_hom.T).T
+    points_cam = points_cam_hom[:, :3]
+
+    valid_z = points_cam[:, 2] > 0
+    if not np.any(valid_z):
+        return np.empty((0, 2)), valid_z
+
+    rvec = np.zeros((3, 1), dtype=np.float32)
+    tvec = np.zeros((3, 1), dtype=np.float32)
+    projected_cv, _ = cv2.projectPoints(points_cam[valid_z], rvec, tvec, K, dist_coeffs)
+    projected = projected_cv[:, 0, :]
+
+    full_projected = np.full((N, 2), -1.0, dtype=np.float32)
+    full_projected[valid_z] = projected
+    return full_projected, valid_z, points_cam  # 返回 points_cam 以便用于深度着色
+
+
+# ----------------------------- 渲染 -----------------------------
+def render_projected_points(image, projected_points, valid_mask,
+                            colors=None, radius=2, use_depth_color=False,
+                            points_cam=None, max_depth=50.0):
+    out_img = image.copy()
+    h, w = out_img.shape[:2]
+
+    valid_indices = np.where(valid_mask)[0]
+    valid_proj = projected_points[valid_mask]
+
+    if len(valid_proj) == 0:
+        print("警告：没有有效投影点可渲染")
+        return out_img
+
+    if use_depth_color and points_cam is not None:
+        depths = points_cam[valid_mask, 2]  # z 值（相机坐标系下）
+        depth_norm = np.clip(depths / max_depth, 0.0, 1.0)
+        depth_int = (depth_norm * 255).astype(np.uint8)
+        color_map = cv2.applyColorMap(depth_int, cv2.COLORMAP_JET)
+        colors_bgr = color_map[:, 0, :]
+    elif colors is not None:
+        valid_colors = colors[valid_mask]
+        colors_bgr = (valid_colors[:, [2, 1, 0]] * 255).astype(np.uint8)
+    else:
+        colors_bgr = np.full((len(valid_proj), 3), (0, 255, 0), dtype=np.uint8)
+
+    for i, (u, v) in enumerate(valid_proj.astype(np.int32)):
+        if 0 <= u < w and 0 <= v < h:
+            cv2.circle(out_img, (u, v), radius, colors_bgr[i].tolist(), -1)
+
+    return out_img
+
+
+# ----------------------------- 主程序 -----------------------------
+def main():
+    # 1. 加载图像
+    img = cv2.imread(IMAGE_FILE)
+    if img is None:
+        raise FileNotFoundError(f"无法读取图像: {IMAGE_FILE}")
+    print(f"图像尺寸: {img.shape[1]}x{img.shape[0]}")
+
+    # 2. 加载点云
+    print(f"读取点云: {PCD_FILE}")
+    points, colors = read_pcd(PCD_FILE)
+    print(f"点云点数: {len(points)}")
+    if colors is not None:
+        print("点云包含颜色信息")
+
+    if sample_ratio < 1.0:
+        n_points = len(points)
+        indices = np.random.choice(n_points, int(n_points * sample_ratio), replace=False)
+        points = points[indices]
+        if colors is not None:
+            colors = colors[indices]
+        print(f"降采样后点数: {len(points)}")
+
+    # 3. 加载标定参数
+    K = load_intrinsics(INTRINSICS_FILE)
+    dist = load_dist_coeffs(DIST_COEFFS_FILE)
+    T = load_extrinsics(EXTRINSICS_FILE)
+    print("标定参数加载完成")
+
+    # 4. 投影
+    print("正在投影...")
+    projected, valid_mask, points_cam = project_points(points, K, dist, T)
+    num_valid = np.sum(valid_mask)
+    print(f"有效投影点数: {num_valid} / {len(points)}")
+
+    if num_valid == 0:
+        print("没有点落在相机前方，请检查外参矩阵是否正确")
+        return
+
+    # 5. 渲染
+    print("渲染投影点...")
+    result = render_projected_points(
+        img, projected, valid_mask, colors=colors,
+        radius=POINT_RADIUS, use_depth_color=USE_DEPTH_COLOR,
+        points_cam=points_cam, max_depth=MAX_DEPTH
+    )
+
+    # 6. 保存
+    cv2.imwrite(OUTPUT_FILE, result)
+    print(f"结果已保存至: {OUTPUT_FILE}")
+
+    # 可选：显示
+    if os.name == "nt" or os.environ.get("DISPLAY"):
+        cv2.imshow("Projection Result", result)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
