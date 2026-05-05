@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""
+激光雷达点云投影到图像（优化版，接近 livox_camera_calib 效果）
+支持二进制 PCD，距离过滤，体素降采样（若 Open3D 可用），深度彩色渲染，边缘增强
+"""
+
+import cv2
+import numpy as np
+import os
+import struct
+
+# ==================== 配置文件路径 ====================
+PCD_FILE = r"C:\Users\ASUS\PycharmProjects\pcd2img\MARS-LVIGpoint_per5\1669702821.499936.pcd"          # 点云文件
+IMAGE_FILE = r"C:\Users\ASUS\PycharmProjects\pcd2img\MARS-LVIGimage_per5\1669702821.584584.jpg"        # 背景图像
+INTRINSICS_FILE = r"C:\Users\ASUS\PycharmProjects\pcd2img\intrinsics.txt"
+DIST_COEFFS_FILE = r"C:\Users\ASUS\PycharmProjects\pcd2img\dist_coeffs.txt"
+EXTRINSICS_FILE = r"C:\Users\ASUS\PycharmProjects\pcd2img\extrinsics.txt"
+OUTPUT_FILE = r"C:\Users\ASUS\PycharmProjects\pcd2img\out\MARS-LVIG_result0.png"
+
+# ==================== 渲染参数 ====================
+POINT_RADIUS = 3                     # 点半径（像素）—— 更精细
+USE_DEPTH_COLOR = True               # 使用深度伪彩色
+MAX_DEPTH = 200.0                     # 深度最大阈值（米）
+
+# ==================== 点云预处理参数 ====================
+ENABLE_DISTANCE_FILTER = True        # 是否过滤距离范围
+Z_MIN = 1.0                          # 最近距离（米）
+Z_MAX = 50.0                         # 最远距离（米）
+
+ENABLE_VOXEL_DOWNSAMPLE = True       # 是否使用体素降采样（需要 open3d）
+VOXEL_SIZE = 0.05                    # 体素边长（米）
+
+# 若体素降采样不可用，则使用随机降采样比例
+RANDOM_SAMPLE_RATIO = 0.05            # 随机采样比例
+
+# ==================== 后处理参数 ====================
+POST_PROCESS_EDGE = False             # 是否增强边缘轮廓
+EDGE_COLOR = [255, 255, 0]           # 边缘颜色（BGR: 青色）
+EDGE_THRESH1 = 50                    # Canny 低阈值
+EDGE_THRESH2 = 150                   # Canny 高阈值
+
+# ====================================================
+
+# ----------------------------- 点云读取（ASCII / Binary）-----------------------------
+def read_pcd_ascii(filepath):
+    """读取 ASCII 格式 PCD"""
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+    header = []
+    data_start = 0
+    for i, line in enumerate(lines):
+        header.append(line.strip())
+        if line.startswith('DATA'):
+            data_format = line.split()[-1].lower()
+            data_start = i + 1
+            break
+    fields = []
+    size = []
+    type_ = []
+    count = []
+    for line in header:
+        if line.startswith('FIELDS'):
+            fields = line.split()[1:]
+        elif line.startswith('SIZE'):
+            size = list(map(int, line.split()[1:]))
+        elif line.startswith('TYPE'):
+            type_ = line.split()[1:]
+        elif line.startswith('COUNT'):
+            count = list(map(int, line.split()[1:]))
+        elif line.startswith('POINTS'):
+            n_points = int(line.split()[1])
+    idx_x = fields.index('x') if 'x' in fields else None
+    idx_y = fields.index('y') if 'y' in fields else None
+    idx_z = fields.index('z') if 'z' in fields else None
+    idx_rgb = None
+    if 'rgb' in fields:
+        idx_rgb = fields.index('rgb')
+    elif 'RGB' in fields:
+        idx_rgb = fields.index('RGB')
+    data_lines = lines[data_start:data_start + n_points]
+    points = []
+    colors = [] if idx_rgb is not None else None
+    for line in data_lines:
+        if not line.strip():
+            continue
+        parts = line.strip().split()
+        x = float(parts[idx_x]) if idx_x is not None else 0.0
+        y = float(parts[idx_y]) if idx_y is not None else 0.0
+        z = float(parts[idx_z]) if idx_z is not None else 0.0
+        points.append([x, y, z])
+        if idx_rgb is not None:
+            raw = parts[idx_rgb]
+            if '.' in raw:
+                rgb_int = int(float(raw))
+                r = (rgb_int >> 16) & 0xFF
+                g = (rgb_int >> 8) & 0xFF
+                b = rgb_int & 0xFF
+            else:
+                rgb_int = int(raw)
+                r = (rgb_int >> 16) & 0xFF
+                g = (rgb_int >> 8) & 0xFF
+                b = rgb_int & 0xFF
+            colors.append([r / 255.0, g / 255.0, b / 255.0])
+    points = np.array(points, dtype=np.float32)
+    if colors is not None:
+        colors = np.array(colors, dtype=np.float32)
+    return points, colors
+
+def read_pcd_binary(filepath):
+    """读取二进制格式 PCD（DATA binary）"""
+    with open(filepath, 'rb') as f:
+        header_lines = []
+        while True:
+            line = f.readline().decode('utf-8').strip()
+            header_lines.append(line)
+            if line.startswith('DATA'):
+                data_format = line.split()[-1].lower()
+                break
+        fields = []
+        size = []
+        type_ = []
+        count = []
+        n_points = 0
+        for line in header_lines:
+            if line.startswith('FIELDS'):
+                fields = line.split()[1:]
+            elif line.startswith('SIZE'):
+                size = list(map(int, line.split()[1:]))
+            elif line.startswith('TYPE'):
+                type_ = line.split()[1:]
+            elif line.startswith('COUNT'):
+                count = list(map(int, line.split()[1:]))
+            elif line.startswith('POINTS'):
+                n_points = int(line.split()[1])
+        idx_x = fields.index('x') if 'x' in fields else None
+        idx_y = fields.index('y') if 'y' in fields else None
+        idx_z = fields.index('z') if 'z' in fields else None
+        idx_rgb = fields.index('rgb') if 'rgb' in fields else (fields.index('RGB') if 'RGB' in fields else None)
+        point_step = sum(size)
+        fmt = '<'
+        for i, typ in enumerate(type_):
+            s = size[i]
+            if typ == 'F':
+                fmt += 'f' if s == 4 else 'd'
+            elif typ == 'U':
+                fmt += 'B' if s == 1 else 'H' if s == 2 else 'I'
+            elif typ == 'I':
+                fmt += 'b' if s == 1 else 'h' if s == 2 else 'i'
+            else:
+                raise ValueError(f"Unknown type {typ}")
+        point_fmt = fmt
+        point_size = struct.calcsize(point_fmt)
+        assert point_size == point_step, "Point size mismatch"
+        data = f.read(n_points * point_step)
+        points = []
+        colors = [] if idx_rgb is not None else None
+        offset = 0
+        for i in range(n_points):
+            values = struct.unpack_from(point_fmt, data, offset)
+            offset += point_size
+            x = values[idx_x] if idx_x is not None else 0.0
+            y = values[idx_y] if idx_y is not None else 0.0
+            z = values[idx_z] if idx_z is not None else 0.0
+            points.append([x, y, z])
+            if idx_rgb is not None:
+                rgb_val = values[idx_rgb]
+                if isinstance(rgb_val, float):
+                    rgb_int = int(rgb_val)
+                else:
+                    rgb_int = rgb_val
+                r = (rgb_int >> 16) & 0xFF
+                g = (rgb_int >> 8) & 0xFF
+                b = rgb_int & 0xFF
+                colors.append([r / 255.0, g / 255.0, b / 255.0])
+        points = np.array(points, dtype=np.float32)
+        if colors:
+            colors = np.array(colors, dtype=np.float32)
+        return points, colors
+
+def read_pcd(filepath):
+    """自动判断 PCD 格式（ASCII / binary）"""
+    with open(filepath, 'rb') as f:
+        header = f.read(4096).decode('utf-8', errors='ignore')
+        if 'DATA ascii' in header:
+            return read_pcd_ascii(filepath)
+        elif 'DATA binary' in header:
+            return read_pcd_binary(filepath)
+        else:
+            raise NotImplementedError("仅支持 ASCII 或 binary 格式的 PCD，不支持 compressed。")
+
+# ----------------------------- 标定参数加载 -----------------------------
+def load_intrinsics(filepath):
+    return np.loadtxt(filepath, dtype=np.float32)
+
+def load_dist_coeffs(filepath):
+    coeffs = np.loadtxt(filepath, dtype=np.float32)
+    if coeffs.ndim == 0:
+        coeffs = np.array([coeffs])
+    return coeffs
+
+def load_extrinsics(filepath):
+    mat = np.loadtxt(filepath, dtype=np.float32)
+    assert mat.shape == (4, 4), "外参矩阵必须是 4x4"
+    return mat
+
+# ----------------------------- 点云预处理函数 -----------------------------
+def distance_filter(points, colors, T, z_min, z_max):
+    """根据相机坐标系下的 Z 值过滤点云"""
+    points_hom = np.hstack((points, np.ones((len(points), 1))))
+    points_cam_hom = (T @ points_hom.T).T
+    z_vals = points_cam_hom[:, 2]
+    mask = (z_vals > z_min) & (z_vals < z_max)
+    points_f = points[mask]
+    colors_f = colors[mask] if colors is not None else None
+    print(f"距离过滤: {len(points)} -> {len(points_f)} 点 (保留 {z_min}~{z_max} 米)")
+    return points_f, colors_f
+
+def voxel_downsample(points, colors, voxel_size):
+    """体素降采样（需要 open3d）"""
+    try:
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        if colors is not None:
+            pcd.colors = o3d.utility.Vector3dVector(colors)
+        pcd_down = pcd.voxel_down_sample(voxel_size)
+        points_down = np.asarray(pcd_down.points)
+        colors_down = np.asarray(pcd_down.colors) if pcd_down.has_colors() else None
+        print(f"体素降采样: {len(points)} -> {len(points_down)} 点 (体素边长 {voxel_size} 米)")
+        return points_down, colors_down
+    except ImportError:
+        print("警告: Open3D 未安装，无法使用体素降采样。将使用随机降采样（比例=%.2f）" % RANDOM_SAMPLE_RATIO)
+        return None, None
+
+def random_downsample(points, colors, ratio):
+    """随机降采样后备方案"""
+    n = len(points)
+    idx = np.random.choice(n, int(n * ratio), replace=False)
+    points_down = points[idx]
+    colors_down = colors[idx] if colors is not None else None
+    print(f"随机降采样: {len(points)} -> {len(points_down)} 点 (比例 {ratio})")
+    return points_down, colors_down
+
+# ----------------------------- 投影核心 -----------------------------
+def project_points(points, K, dist_coeffs, T_lidar_to_cam):
+    N = points.shape[0]
+    points_hom = np.hstack((points, np.ones((N, 1))))
+    points_cam_hom = (T_lidar_to_cam @ points_hom.T).T
+    points_cam = points_cam_hom[:, :3]
+    valid_z = points_cam[:, 2] > 0
+    if not np.any(valid_z):
+        return np.empty((0, 2)), valid_z, points_cam
+    rvec = np.zeros((3, 1), dtype=np.float32)
+    tvec = np.zeros((3, 1), dtype=np.float32)
+    projected_cv, _ = cv2.projectPoints(points_cam[valid_z], rvec, tvec, K, dist_coeffs)
+    projected = projected_cv[:, 0, :]
+    full_projected = np.full((N, 2), -1.0, dtype=np.float32)
+    full_projected[valid_z] = projected
+    return full_projected, valid_z, points_cam
+
+# ----------------------------- 渲染函数（深度颜色） -----------------------------
+def render_projected_points(image, projected_points, valid_mask,
+                            colors=None, radius=2, use_depth_color=False,
+                            points_cam=None, max_depth=50.0):
+    out_img = image.copy()
+    h, w = out_img.shape[:2]
+    valid_indices = np.where(valid_mask)[0]
+    valid_proj = projected_points[valid_mask]
+    if len(valid_proj) == 0:
+        print("警告：没有有效投影点可渲染")
+        return out_img
+    if use_depth_color and points_cam is not None:
+        depths = points_cam[valid_mask, 2]
+        depth_norm = np.clip(depths / max_depth, 0.0, 1.0)
+        depth_int = (depth_norm * 255).astype(np.uint8)
+        # 使用 JET 颜色映射（红近蓝远），也可改为 COLORMAP_INFERNO 等
+        color_map = cv2.applyColorMap(depth_int, cv2.COLORMAP_JET)
+        colors_bgr = color_map[:, 0, :]
+    elif colors is not None:
+        valid_colors = colors[valid_mask]
+        colors_bgr = (valid_colors[:, [2, 1, 0]] * 255).astype(np.uint8)
+    else:
+        colors_bgr = np.full((len(valid_proj), 3), (0, 255, 0), dtype=np.uint8)
+    for i, (u, v) in enumerate(valid_proj.astype(np.int32)):
+        if 0 <= u < w and 0 <= v < h:
+            cv2.circle(out_img, (u, v), radius, colors_bgr[i].tolist(), -1)
+    return out_img
+
+# ----------------------------- 后处理：边缘增强 -----------------------------
+def enhance_edges(image, threshold1=50, threshold2=150, edge_color=(0, 255, 255)):
+    """提取深度图的边缘并以指定颜色叠加"""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, threshold1, threshold2)
+    result = image.copy()
+    result[edges > 0] = edge_color
+    return result
+
+# ----------------------------- 主程序 -----------------------------
+def main():
+    # 1. 加载图像
+    img = cv2.imread(IMAGE_FILE)
+    if img is None:
+        raise FileNotFoundError(f"无法读取图像: {IMAGE_FILE}")
+    print(f"图像尺寸: {img.shape[1]}x{img.shape[0]}")
+
+    # 2. 加载标定参数（因为距离过滤需要 T）
+    K = load_intrinsics(INTRINSICS_FILE)
+    dist = load_dist_coeffs(DIST_COEFFS_FILE)
+    T = load_extrinsics(EXTRINSICS_FILE)
+    print("标定参数加载完成")
+
+    # 3. 加载点云
+    print(f"读取点云: {PCD_FILE}")
+    points, colors = read_pcd(PCD_FILE)
+    print(f"原始点云点数: {len(points)}")
+
+    # 4. 距离过滤（可选）
+    if ENABLE_DISTANCE_FILTER:
+        points, colors = distance_filter(points, colors, T, Z_MIN, Z_MAX)
+
+    # 5. 降采样（优先体素，后备随机）
+    if ENABLE_VOXEL_DOWNSAMPLE:
+        p_down, c_down = voxel_downsample(points, colors, VOXEL_SIZE)
+        if p_down is not None:
+            points, colors = p_down, c_down
+        else:
+            points, colors = random_downsample(points, colors, RANDOM_SAMPLE_RATIO)
+    else:
+        points, colors = random_downsample(points, colors, RANDOM_SAMPLE_RATIO)
+
+    # 6. 投影
+    print("正在投影...")
+    projected, valid_mask, points_cam = project_points(points, K, dist, T)
+    num_valid = np.sum(valid_mask)
+    print(f"有效投影点数: {num_valid} / {len(points)}")
+    if num_valid == 0:
+        print("没有点落在相机前方，请检查外参矩阵")
+        return
+
+    # 7. 渲染
+    print("渲染投影点...")
+    result = render_projected_points(
+        img, projected, valid_mask, colors=colors,
+        radius=POINT_RADIUS, use_depth_color=USE_DEPTH_COLOR,
+        points_cam=points_cam, max_depth=MAX_DEPTH
+    )
+
+    # 8. 后处理（边缘增强）
+    if POST_PROCESS_EDGE:
+        result = enhance_edges(result, EDGE_THRESH1, EDGE_THRESH2, EDGE_COLOR)
+
+    # 9. 保存
+    cv2.imwrite(OUTPUT_FILE, result)
+    print(f"结果已保存至: {OUTPUT_FILE}")
+
+    # 可选显示
+    if os.name == "nt" or os.environ.get("DISPLAY"):
+        cv2.imshow("Projection Result", result)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
