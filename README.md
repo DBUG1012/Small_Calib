@@ -9,8 +9,7 @@
 
 ## sample的下载
 文件夹中包含的是原始图像文件，下载pcd文件请使用百度网盘。
-、、、
 通过网盘分享的文件：sample
 链接: https://pan.baidu.com/s/1m8XIJP7kh9iu4H2bPg7vsg?pwd=dbug 提取码: dbug 
 --来自百度网盘超级会员v6的分享
-、、、
+
